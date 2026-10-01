@@ -14,6 +14,7 @@ export default function App() {
         <Route path="/" element={<LandingPage />} />
         <Route path="/create" element={<CreateInterviewPage />} />
         <Route path="/join" element={<JoinInterviewPage />} />
+        <Route path="/join/:roomId" element={<JoinInterviewPage />} />
         <Route path="/interview/:roomId" element={<InterviewRoomPage />} />
         <Route path="/report/:roomId" element={<InterviewReportPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />

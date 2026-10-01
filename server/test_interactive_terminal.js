@@ -65,6 +65,18 @@ async function runInteractiveTerminalTests() {
   });
   const tokenB = joinBRes.data.token;
 
+  // Interviewer admits Candidate A and Candidate B
+  await request(`/api/interviews/${roomId}/admission-decision`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${interviewerToken}` },
+    body: JSON.stringify({ candidateId: 'Candidate A', decision: 'ACCEPT' })
+  });
+  await request(`/api/interviews/${roomId}/admission-decision`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${interviewerToken}` },
+    body: JSON.stringify({ candidateId: 'Candidate B', decision: 'ACCEPT' })
+  });
+
   const socketA = createSocket(tokenA);
   const socketB = createSocket(tokenB);
   const socketInterviewer = createSocket(interviewerToken);

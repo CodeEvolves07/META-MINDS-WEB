@@ -33,7 +33,7 @@ export const api = {
     return res.data;
   },
 
-  // Candidate joins interview session (Issues signed candidate token)
+  // Candidate joins interview session (Issues signed candidate token & requests admission)
   joinInterview: async (roomId, candidateName) => {
     const res = await apiClient.post(`/interviews/${roomId}/join`, {
       candidateName
@@ -41,18 +41,45 @@ export const api = {
     return res.data;
   },
 
-  // Fetch interview details
+  // Validate interview code and check deadline (Public room check - no private candidate data)
+  validateInterview: async (roomId, candidateId = null) => {
+    const res = await apiClient.post(`/interviews/${roomId}/validate`, {
+      candidateId
+    });
+    return res.data;
+  },
+
+  // Get candidate admission status (POST required)
+  getAdmissionStatus: async (roomId, candidateId = null) => {
+    const res = await apiClient.post(`/interviews/${roomId}/admission-status`, {
+      candidateId
+    });
+    return res.data;
+  },
+
+  // Interviewer gets pending admission requests (POST required)
+  getPendingRequests: async (roomId) => {
+    const res = await apiClient.post(`/interviews/${roomId}/pending-requests`);
+    return res.data;
+  },
+
+  // Interviewer decides admission (ACCEPT | DECLINE)
+  decideAdmission: async (roomId, candidateId, decision) => {
+    const res = await apiClient.post(`/interviews/${roomId}/admission-decision`, {
+      candidateId,
+      decision
+    });
+    return res.data;
+  },
+
+  // Fetch interview details (POST required)
   getInterview: async (roomId, role = 'candidate', candidateId = null, token = null) => {
     const authHeaders = token ? { 'Authorization': `Bearer ${token}` } : {};
-    const res = await apiClient.get(`/interviews/${roomId}`, {
+    const res = await apiClient.post(`/interviews/${roomId}/session`, {
+      candidateId
+    }, {
       headers: {
-        'x-user-role': role,
-        ...(candidateId ? { 'x-candidate-id': candidateId } : {}),
         ...authHeaders
-      },
-      params: {
-        role,
-        ...(candidateId ? { candidateId } : {})
       }
     });
     return res.data;
@@ -63,23 +90,20 @@ export const api = {
     const res = await apiClient.post(`/interviews/${roomId}/assign-question`, {
       candidateId,
       questionId
-    }, {
-      headers: {
-        'x-user-role': 'interviewer'
-      }
     });
     return res.data;
   },
 
-  // Save interviewer private notes (INTERVIEWER ONLY)
-  saveNotes: async (roomId, notesData, role = 'interviewer') => {
-    const res = await apiClient.put(`/interviews/${roomId}/notes`, {
-      ...notesData,
-      role
-    }, {
-      headers: {
-        'x-user-role': role
-      }
+  // Save interviewer private notes (INTERVIEWER ONLY - POST)
+  saveNotes: async (roomId, notesData) => {
+    const res = await apiClient.post(`/interviews/${roomId}/notes`, notesData);
+    return res.data;
+  },
+
+  // Get candidate private notes (INTERVIEWER ONLY - POST)
+  getCandidateNotes: async (roomId, candidateId = null) => {
+    const res = await apiClient.post(`/interviews/${roomId}/candidate-notes`, {
+      candidateId
     });
     return res.data;
   },
@@ -96,12 +120,10 @@ export const api = {
     return res.data;
   },
 
-  // Get final report
-  getReport: async (roomId, role = 'candidate') => {
-    const res = await apiClient.get(`/interviews/${roomId}/report`, {
-      headers: {
-        'x-user-role': role
-      }
+  // Get final report (POST required)
+  getReport: async (roomId, role = 'candidate', candidateId = null) => {
+    const res = await apiClient.post(`/interviews/${roomId}/report`, {
+      candidateId
     });
     return res.data;
   },

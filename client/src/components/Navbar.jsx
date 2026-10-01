@@ -8,17 +8,24 @@ import {
   PhoneOff, 
   UserCheck, 
   ShieldAlert,
-  Sparkles
+  Sparkles,
+  Clock
 } from 'lucide-react';
+import { useCountdownTimer } from '../utils/countdown';
 
 export default function Navbar({ 
   roomId, 
   role, 
   connectionStatus, 
   socketConnected, 
-  onEndInterview 
+  onEndInterview,
+  isJoinWindowExpired = false,
+  meetingJoinDeadline = null,
+  serverTime = null
 }) {
   const [copied, setCopied] = useState(false);
+  const { secondsRemaining, isExpired: timerExpired, formatted } = useCountdownTimer(meetingJoinDeadline, serverTime);
+  const effectivelyExpired = isJoinWindowExpired || timerExpired;
 
   const handleCopyId = () => {
     if (!roomId) return;
@@ -101,6 +108,26 @@ export default function Navbar({
         )}
 
         {getStatusBadge()}
+
+        {/* Join window countdown badge for interviewer and candidate */}
+        {meetingJoinDeadline && (
+          effectivelyExpired || (secondsRemaining !== null && secondsRemaining <= 0) ? (
+            <span className="hidden md:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border bg-slate-800 text-slate-400 border-slate-700">
+              <span className="w-1.5 h-1.5 rounded-full bg-slate-500"></span>
+              <span>Join window expired</span>
+            </span>
+          ) : (
+            <span className="hidden md:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border bg-emerald-500/10 text-emerald-400 border-emerald-500/20">
+              <Clock className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+              <span>
+                {role === 'interviewer' 
+                  ? `New candidate entry closes in: ` 
+                  : `Time remaining for new candidates: `}
+                <strong className="font-mono font-bold text-emerald-300">{formatted}</strong>
+              </span>
+            </span>
+          )
+        )}
       </div>
 
       {/* Right: Role indicator & Action buttons */}

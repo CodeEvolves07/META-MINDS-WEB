@@ -31,7 +31,16 @@ async function runMultiCandidateTest() {
     problemId: 'two-sum'
   });
   const roomId = createRes.data.interview.id;
+  const interviewerToken = createRes.data.token;
   console.log(`✅ Room Created with ID: ${roomId}\n`);
+
+  // Interviewer authorizes test candidates
+  for (const cName of ['Candidate 1 (Alex)', 'Candidate 2 (Morgan)', 'Candidate 3 (Jordan)']) {
+    await axios.post(`${SERVER_URL}/api/interviews/${roomId}/admission-decision`, {
+      candidateId: cName,
+      decision: 'ACCEPTED'
+    }, { headers: { Authorization: `Bearer ${interviewerToken}` } });
+  }
 
   // Connect Interviewer
   const interviewerSocket = io(SERVER_URL, { transports: ['websocket'] });
@@ -39,7 +48,8 @@ async function runMultiCandidateTest() {
   interviewerSocket.emit('join-room', {
     roomId,
     role: 'interviewer',
-    userName: 'Dr. Jane Interviewer'
+    userName: 'Dr. Jane Interviewer',
+    token: interviewerToken
   });
   console.log('✅ Interviewer entered room');
 

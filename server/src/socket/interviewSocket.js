@@ -9,38 +9,120 @@ export function setupInterviewSocket(io) {
     let currentUserRole = null;
     let currentUserName = null;
 
-    // 1. Join Room
+    // 1. Join Room (Strict Authentication & Authorization)
     socket.on('join-room', ({ roomId, role, userName, candidateId, token }) => {
       if (!roomId) return;
 
-      let effectiveRole = role || 'candidate';
-      let effectiveUserName = userName || (effectiveRole === 'interviewer' ? 'Interviewer' : 'Candidate');
-      let effectiveCandidateId = candidateId || (effectiveRole === 'candidate' ? effectiveUserName : null);
-
-      // Verify token if provided
+      // Extract and verify authentication token
       const tokenToVerify = token || socket.handshake.auth?.token;
-      if (tokenToVerify) {
-        const verified = verifyToken(tokenToVerify);
-        if (verified && verified.roomId === roomId) {
-          // Token claims are immutable and override client-supplied values
-          effectiveRole = verified.role;
-          effectiveUserName = verified.userName;
-          effectiveCandidateId = verified.candidateId;
-        } else if (verified && verified.roomId !== roomId) {
-          console.warn(`[SECURITY] Blocked socket ${socket.id} joining ${roomId} with token for ${verified.roomId}`);
-          socket.emit('error', { message: 'Token not authorized for this interview room.' });
-          return;
-        }
-      } else {
-        if (effectiveRole === 'candidate') {
-          interviewStore.registerCandidate(roomId, effectiveUserName);
-        }
+      if (!tokenToVerify) {
+        console.warn(`[SECURITY] Blocked unauthenticated socket ${socket.id} attempting to join room ${roomId}`);
+        socket.emit('error', { message: 'Unauthorized: Authentication token is required to join interview room.' });
+        return;
       }
+
+      const verified = verifyToken(tokenToVerify);
+      if (!verified) {
+        console.warn(`[SECURITY] Blocked socket ${socket.id} with invalid/expired token for room ${roomId}`);
+        socket.emit('error', { message: 'Unauthorized: Invalid or expired authentication token.' });
+        return;
+      }
+
+      if (verified.roomId !== roomId) {
+        console.warn(`[SECURITY] Blocked socket ${socket.id} joining ${roomId} with token for ${verified.roomId}`);
+        socket.emit('error', { message: 'Forbidden: Token not authorized for this interview room.' });
+        return;
+      }
+
+      // Token claims are immutable and strictly override client-supplied values
+      const effectiveRole = verified.role;
+      const effectiveUserName = verified.userName;
+      const effectiveCandidateId = verified.candidateId;
 
       currentRoomId = roomId;
       currentUserRole = effectiveRole;
       currentUserName = effectiveUserName;
       const currentCandidateId = effectiveCandidateId;
+
+      // SERVER-SIDE DISQUALIFICATION GATE: Disqualified candidates are blocked permanently
+      if (effectiveRole === 'candidate') {
+        if (interviewStore.isCandidateDisqualified(roomId, effectiveCandidateId)) {
+          socket.emit('admission-status', {
+            status: 'DISQUALIFIED',
+            candidateId: effectiveCandidateId,
+            disqualified: true,
+            message: 'You have been disqualified from this interview and cannot rejoin.'
+          });
+          socket.emit('candidate-disqualified', {
+            candidateId: effectiveCandidateId,
+            roomId,
+            disqualified: true,
+            message: 'You have been disqualified from this interview and cannot rejoin.'
+          });
+          return;
+        }
+
+        const isAccepted = interviewStore.isCandidateAccepted(roomId, effectiveCandidateId);
+        const isExpired = interviewStore.isJoinWindowExpired(roomId);
+
+        // 5-MINUTE JOIN WINDOW ENFORCEMENT:
+        if (isExpired && !isAccepted) {
+          socket.emit('admission-status', {
+            status: 'DECLINED',
+            candidateId: effectiveCandidateId,
+            expired: true,
+            message: 'Your time for joining the meeting has expired.'
+          });
+          return;
+        }
+
+        const admission = interviewStore.getAdmissionStatus(roomId, effectiveCandidateId) || 'PENDING';
+        if (admission !== 'ACCEPTED') {
+          // Join strictly the isolated waiting channel to receive real-time approval/rejection
+          socket.join(`waiting:${roomId}:${effectiveCandidateId}`);
+          socket.data = {
+            role: 'candidate',
+            userName: effectiveUserName,
+            candidateId: effectiveCandidateId,
+            roomId,
+            isWaiting: true
+          };
+
+          socket.emit('admission-status', {
+            status: admission,
+            candidateId: effectiveCandidateId,
+            message: admission === 'DECLINED'
+              ? 'Your request to join the interview was declined by the interviewer.'
+              : 'Waiting for interviewer approval before entering the interview room.'
+          });
+
+          if (admission === 'PENDING') {
+            const roomSockets = io.sockets.adapter.rooms.get(roomId);
+            if (roomSockets) {
+              for (const sId of roomSockets) {
+                const target = io.sockets.sockets.get(sId);
+                if (target && target.data?.role === 'interviewer') {
+                  target.emit('candidate-join-request', {
+                    candidateId: effectiveCandidateId,
+                    candidateName: effectiveUserName,
+                    roomId,
+                    requestedAt: new Date().toISOString()
+                  });
+                }
+              }
+            }
+          }
+
+          // HARD SECURITY BARRIER:
+          // Do NOT join roomId! Do NOT emit room-state! Do NOT notify peers!
+          return;
+        }
+      }
+
+      // If accepted candidate, clean up any previous waiting channel
+      if (effectiveRole === 'candidate') {
+        socket.leave(`waiting:${roomId}:${effectiveCandidateId}`);
+      }
 
       socket.data = {
         role: currentUserRole,
@@ -67,7 +149,12 @@ export function setupInterviewSocket(io) {
         candidateCode: interview?.candidateCode || {},
         candidateOutputs: interview?.candidateOutputs || {},
         assignedQuestions: interview?.assignedQuestions || {},
-        registeredCandidates: interview?.registeredCandidates || []
+        registeredCandidates: interview?.registeredCandidates || [],
+        tabViolations: currentUserRole === 'interviewer' 
+          ? (interview?.tabViolations || {}) 
+          : (currentCandidateId ? { [currentCandidateId]: interviewStore.getTabViolations(roomId, currentCandidateId) } : {}),
+        candidateAdmissions: currentUserRole === 'interviewer' ? (interview?.candidateAdmissions || {}) : {},
+        pendingRequests: currentUserRole === 'interviewer' ? interviewStore.getPendingJoinRequests(roomId) : []
       });
 
       // Notify joining socket about existing peers already in this room
@@ -235,9 +322,12 @@ export function setupInterviewSocket(io) {
       }
     });
 
-    // Backwards-compatible problem change
+    // Problem change (Authorized to Interviewer only)
     socket.on('problem-change', ({ roomId, problemId }) => {
       if (!roomId) return;
+      if (socket.data?.role !== 'interviewer' || socket.data?.roomId !== roomId) {
+        return;
+      }
       interviewStore.updateProblem(roomId, problemId);
       socket.to(roomId).emit('problem-update', { problemId });
     });
@@ -411,24 +501,25 @@ export function setupInterviewSocket(io) {
         questionId
       });
 
-      const session = await interactiveExecutionManager.startSession({
+      let session = null;
+      session = await interactiveExecutionManager.startSession({
         roomId,
         candidateId: authorCandId,
         questionId,
         code,
         language: language || 'python',
-        onOutput: ({ stream, data }) => {
+        onOutput: ({ sessionId, stream, data }) => {
           emitToAuthorized('terminal-output', {
-            sessionId: session?.id,
+            sessionId: sessionId || session?.id,
             candidateId: authorCandId,
             questionId,
             stream,
             data
           });
         },
-        onExit: ({ exitCode, signal, totalOutput }) => {
+        onExit: ({ sessionId, exitCode, signal, totalOutput }) => {
           emitToAuthorized('terminal-exit', {
-            sessionId: session?.id,
+            sessionId: sessionId || session?.id,
             candidateId: authorCandId,
             questionId,
             exitCode,
@@ -486,7 +577,26 @@ export function setupInterviewSocket(io) {
         return;
       }
 
-      interactiveExecutionManager.writeStdin(sessionId, input);
+      const written = interactiveExecutionManager.writeStdin(sessionId, input);
+      if (!written) return;
+
+      // Forward input in real time ONLY to authorized interviewer(s) for this room
+      const roomSockets = io.sockets.adapter.rooms.get(roomId);
+      if (roomSockets) {
+        const payload = {
+          sessionId,
+          candidateId: session.candidateId,
+          questionId: session.questionId,
+          input
+        };
+        for (const sId of roomSockets) {
+          const targetSocket = io.sockets.sockets.get(sId);
+          if (targetSocket && targetSocket.data?.role === 'interviewer') {
+            targetSocket.emit('terminal-stdin', payload);
+            targetSocket.emit('interactive:stdin', payload);
+          }
+        }
+      }
     });
 
     socket.on('terminal-stop', ({ roomId, sessionId }) => {
@@ -578,6 +688,299 @@ export function setupInterviewSocket(io) {
       interactiveExecutionManager.cleanupRoom(roomId);
       interviewStore.endInterview(roomId);
       io.in(roomId).emit('interview-ended', { roomId });
+    });
+
+    // 8.5 Candidate Admission Management (Accept / Decline by Interviewer)
+    socket.on('admission-decision', ({ roomId, candidateId, decision }) => {
+      if (!roomId || !candidateId || !decision) return;
+
+      // Strict role verification: ONLY authorized interviewer can make admission decisions
+      if (socket.data?.role !== 'interviewer') {
+        console.warn(`[SECURITY] Blocked unauthorized admission-decision attempt from socket ${socket.id}`);
+        socket.emit('error', { message: 'Unauthorized: Only interviewers can accept or decline candidates.' });
+        return;
+      }
+
+      if (interviewStore.isCandidateDisqualified(roomId, candidateId)) {
+        socket.emit('error', { message: 'Cannot admit candidate: Candidate has been disqualified from this interview.' });
+        return;
+      }
+
+      const normalized = (decision || '').toUpperCase();
+      const finalDecision = (normalized === 'ACCEPT' || normalized === 'ACCEPTED') ? 'ACCEPTED' : 'DECLINED';
+
+      // 5-MINUTE JOIN WINDOW ENFORCEMENT ON PENDING CANDIDATE:
+      // If interviewer attempts to accept AFTER deadline and candidate was not already accepted:
+      if (finalDecision === 'ACCEPTED') {
+        if (interviewStore.isJoinWindowExpired(roomId) && !interviewStore.isCandidateAccepted(roomId, candidateId)) {
+          interviewStore.setAdmissionDecision(roomId, candidateId, 'DECLINED');
+          socket.emit('error', { message: 'The 5-minute join window has expired. New candidates cannot be admitted.' });
+          io.to(`waiting:${roomId}:${candidateId}`).emit('admission-status', {
+            status: 'DECLINED',
+            candidateId,
+            expired: true,
+            message: 'Your time for joining the meeting has expired.'
+          });
+          io.to(`waiting:${roomId}:${candidateId}`).emit('candidate-join-declined', {
+            candidateId,
+            roomId,
+            expired: true,
+            message: 'Your time for joining the meeting has expired.'
+          });
+          const pending = interviewStore.getPendingJoinRequests(roomId);
+          const roomSockets = io.sockets.adapter.rooms.get(roomId);
+          if (roomSockets) {
+            for (const sId of roomSockets) {
+              const target = io.sockets.sockets.get(sId);
+              if (target && target.data?.role === 'interviewer') {
+                target.emit('candidate-admission-updated', {
+                  candidateId,
+                  decision: 'DECLINED',
+                  pendingRequests: pending
+                });
+              }
+            }
+          }
+          return;
+        }
+      }
+
+      interviewStore.setAdmissionDecision(roomId, candidateId, finalDecision);
+
+      // Notify candidate socket in real time on their isolated waiting channel
+      io.to(`waiting:${roomId}:${candidateId}`).emit('admission-status', {
+        status: finalDecision,
+        candidateId,
+        message: finalDecision === 'ACCEPTED'
+          ? 'Your request was accepted. You may now join the interview.'
+          : 'Your request to join the interview was declined by the interviewer.'
+      });
+
+      if (finalDecision === 'ACCEPTED') {
+        io.to(`waiting:${roomId}:${candidateId}`).emit('candidate-join-accepted', {
+          candidateId,
+          roomId
+        });
+      } else {
+        io.to(`waiting:${roomId}:${candidateId}`).emit('candidate-join-declined', {
+          candidateId,
+          roomId
+        });
+      }
+
+      // Notify all interviewers with updated pending list
+      const pending = interviewStore.getPendingJoinRequests(roomId);
+      const roomSockets = io.sockets.adapter.rooms.get(roomId);
+      if (roomSockets) {
+        for (const sId of roomSockets) {
+          const target = io.sockets.sockets.get(sId);
+          if (target && target.data?.role === 'interviewer') {
+            target.emit('candidate-admission-updated', {
+              candidateId,
+              decision: finalDecision,
+              pendingRequests: pending
+            });
+          }
+        }
+      }
+    });
+
+    // Candidate explicit join request (creates PENDING record and notifies interviewers)
+    socket.on('candidate:join-request', ({ roomId, candidateName, candidateId }) => {
+      if (!roomId) return;
+      const cleanName = (candidateName || candidateId || socket.data?.candidateId || currentUserName || 'Candidate').trim();
+
+      // DISQUALIFICATION ENFORCEMENT: Disqualified candidates can never rejoin or request admission
+      if (interviewStore.isCandidateDisqualified(roomId, cleanName)) {
+        socket.join(`waiting:${roomId}:${cleanName}`);
+        socket.emit('admission-status', {
+          status: 'DISQUALIFIED',
+          candidateId: cleanName,
+          disqualified: true,
+          message: 'You have been disqualified from this interview and cannot rejoin.'
+        });
+        socket.emit('candidate-disqualified', {
+          candidateId: cleanName,
+          roomId,
+          disqualified: true,
+          message: 'You have been disqualified from this interview and cannot rejoin.'
+        });
+        return;
+      }
+
+      // 5-MINUTE JOIN WINDOW ENFORCEMENT:
+      // If expired and candidate is NOT already accepted:
+      if (interviewStore.isJoinWindowExpired(roomId) && !interviewStore.isCandidateAccepted(roomId, cleanName)) {
+        socket.join(`waiting:${roomId}:${cleanName}`);
+        socket.emit('admission-status', {
+          status: 'DECLINED',
+          candidateId: cleanName,
+          expired: true,
+          message: 'Your time for joining the meeting has expired.'
+        });
+        socket.emit('candidate-join-declined', {
+          candidateId: cleanName,
+          roomId,
+          expired: true,
+          message: 'Your time for joining the meeting has expired.'
+        });
+        return;
+      }
+
+      const admission = interviewStore.requestAdmission(roomId, cleanName);
+
+      socket.join(`waiting:${roomId}:${cleanName}`);
+      socket.data = {
+        role: 'candidate',
+        userName: cleanName,
+        candidateId: cleanName,
+        roomId,
+        isWaiting: true
+      };
+
+      socket.emit('admission-status', {
+        status: admission,
+        candidateId: cleanName,
+        message: admission === 'DECLINED'
+          ? 'Your request to join the interview was declined by the interviewer.'
+          : 'Waiting for interviewer approval before entering the interview room.'
+      });
+
+      if (admission === 'PENDING') {
+        const roomSockets = io.sockets.adapter.rooms.get(roomId);
+        if (roomSockets) {
+          for (const sId of roomSockets) {
+            const target = io.sockets.sockets.get(sId);
+            if (target && target.data?.role === 'interviewer') {
+              target.emit('candidate-join-request', {
+                candidateId: cleanName,
+                candidateName: cleanName,
+                roomId,
+                requestedAt: new Date().toISOString()
+              });
+            }
+          }
+        }
+      }
+    });
+
+    // 8.6 Active Screen Monitoring for Admitted Candidates (Tab departure detection & disqualification)
+    socket.on('candidate:screen-hidden', () => {
+      // 1. Authenticate candidate using existing authentication and socket data
+      const roomId = socket.data?.roomId || currentRoomId;
+      const candidateId = socket.data?.candidateId || currentUserName;
+      const role = socket.data?.role || currentUserRole;
+
+      if (!roomId || !candidateId) return;
+
+      // Only admitted candidates inside the interview room are monitored
+      if (role !== 'candidate') return;
+      if (!interviewStore.exists(roomId)) return;
+
+      // Verify candidate is currently ACCEPTED
+      const currentAdmission = interviewStore.getAdmissionStatus(roomId, candidateId);
+      if (currentAdmission !== 'ACCEPTED') return;
+
+      // Verify candidate is not already DISQUALIFIED
+      if (interviewStore.isCandidateDisqualified(roomId, candidateId)) return;
+
+      // Authoritative server-side violation increment
+      const result = interviewStore.recordScreenViolation(roomId, candidateId);
+      if (result.duplicate || !result.count) {
+        return;
+      }
+
+      const candidateName = socket.data?.userName || candidateId;
+
+      if (result.count === 1 || result.count === 2) {
+        // VIOLATION #1 & #2:
+        // Candidate remains in meeting.
+        // Show candidate warning: "Warning: You are visiting another tab. This is not allowed. You will be disqualified."
+        socket.emit('screen-violation-warning', {
+          violations: result.count,
+          candidateId,
+          message: 'Warning: You are visiting another tab. This is not allowed. You will be disqualified.'
+        });
+
+        // Notify only the authorized interviewer: "[Candidate Name] left the interview screen. Tab violations: {count}"
+        const roomSockets = io.sockets.adapter.rooms.get(roomId);
+        if (roomSockets) {
+          for (const sId of roomSockets) {
+            const target = io.sockets.sockets.get(sId);
+            if (target && target.data?.role === 'interviewer') {
+              target.emit('candidate-screen-violation', {
+                candidateId,
+                candidateName,
+                violations: result.count,
+                disqualified: false,
+                message: `${candidateName} left the interview screen. Tab violations: ${result.count}`
+              });
+            }
+          }
+        }
+      } else if (result.count >= 3) {
+        // VIOLATION #3: IMMEDIATELY DISQUALIFY THE CANDIDATE
+        // 1. Notify the candidate
+        socket.emit('candidate-disqualified', {
+          candidateId,
+          roomId,
+          violations: result.count,
+          disqualified: true,
+          message: 'You have been disqualified from the interview because you visited another tab three times.'
+        });
+        socket.emit('admission-status', {
+          status: 'DISQUALIFIED',
+          candidateId,
+          disqualified: true,
+          message: 'You have been disqualified from the interview because you visited another tab three times.'
+        });
+
+        // 2. Notify the authorized interviewer: "[Candidate Name] has been disqualified after leaving the interview screen 3 times."
+        const roomSockets = io.sockets.adapter.rooms.get(roomId);
+        if (roomSockets) {
+          for (const sId of roomSockets) {
+            const target = io.sockets.sockets.get(sId);
+            if (target && target.data?.role === 'interviewer') {
+              target.emit('candidate-screen-violation', {
+                candidateId,
+                candidateName,
+                violations: result.count,
+                disqualified: true,
+                message: `${candidateName} has been disqualified after leaving the interview screen 3 times.`
+              });
+              target.emit('candidate-admission-updated', {
+                candidateId,
+                decision: 'DISQUALIFIED',
+                violations: result.count
+              });
+            }
+          }
+        }
+
+        // 3. Remove candidate from interview using existing candidate removal mechanism
+        interactiveExecutionManager.killCandidateSession(roomId, candidateId, 'Candidate disqualified');
+        socket.leave(roomId);
+
+        // Notify remaining participants via existing user-left mechanism
+        socket.to(roomId).emit('user-left', {
+          socketId: socket.id,
+          role: 'candidate',
+          userName: candidateName,
+          candidateId
+        });
+      }
+    });
+
+    socket.on('candidate:screen-visible', () => {
+      const roomId = socket.data?.roomId || currentRoomId;
+      const candidateId = socket.data?.candidateId || currentUserName;
+      const role = socket.data?.role || currentUserRole;
+
+      if (!roomId || !candidateId || role !== 'candidate') return;
+      if (!interviewStore.exists(roomId)) return;
+
+      // Update screen state back to visible (DO NOT increment counter!)
+      interviewStore.setCandidateScreenState(roomId, candidateId, 'visible');
     });
 
     // 9. Disconnect handling (notify remaining participants & cleanup abandoned processes)

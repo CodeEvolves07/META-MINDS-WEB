@@ -14,15 +14,72 @@ const server = http.createServer(app);
 
 const PORT = process.env.PORT || 5001;
 
+// Security Headers & Cache-Control Middleware
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+
+  // Prevent caching of private application data
+  if (req.path.startsWith('/api/interviews') || req.path.startsWith('/api/judge0')) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+  }
+  next();
+});
+
+// Lightweight In-Memory Rate Limiter for Abuse Protection (Section 23)
+const rateLimitMap = new Map();
+function createRateLimiter(windowMs, maxRequests, keyPrefix) {
+  return (req, res, next) => {
+    const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+    const key = `${keyPrefix}:${ip}`;
+    const now = Date.now();
+
+    const record = rateLimitMap.get(key) || { count: 0, resetTime: now + windowMs };
+    if (now > record.resetTime) {
+      record.count = 1;
+      record.resetTime = now + windowMs;
+    } else {
+      record.count += 1;
+    }
+    rateLimitMap.set(key, record);
+
+    if (record.count > maxRequests) {
+      return res.status(429).json({
+        success: false,
+        message: 'Too many requests. Please wait a moment before trying again.'
+      });
+    }
+    next();
+  };
+}
+
+// Clean up stale rate limit entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, record] of rateLimitMap.entries()) {
+    if (now > record.resetTime) {
+      rateLimitMap.delete(key);
+    }
+  }
+}, 5 * 60 * 1000);
+
 // CORS setup
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-role']
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-auth-token']
 }));
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Apply rate limiting on sensitive join requests (max 60/min) and code execution (max 120/min)
+app.use('/api/interviews/:id/join', createRateLimiter(60 * 1000, 60, 'join'));
+app.use('/api/judge0/run', createRateLimiter(60 * 1000, 120, 'exec'));
 
 // Socket.IO setup
 const io = new Server(server, {
@@ -31,6 +88,7 @@ const io = new Server(server, {
     methods: ['GET', 'POST']
   }
 });
+app.set('io', io);
 
 // Setup Real-time WebRTC and Collaborative Editing Socket
 setupInterviewSocket(io);

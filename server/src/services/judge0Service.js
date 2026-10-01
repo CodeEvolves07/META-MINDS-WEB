@@ -21,6 +21,15 @@ const PYTHON_BIN = fs.existsSync('/Library/Frameworks/Python.framework/Versions/
   ? '/Library/Frameworks/Python.framework/Versions/3.14/bin/python3'
   : 'python3';
 
+// Sanitized execution environment: untrusted code can NEVER access AUTH_SECRET or server credentials
+const SANITIZED_EXEC_ENV = {
+  PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+  LANG: 'en_US.UTF-8',
+  LC_ALL: 'en_US.UTF-8',
+  PYTHONUNBUFFERED: '1',
+  NODE_PATH: process.env.NODE_PATH || ''
+};
+
 /**
  * Execute real code without fake outputs or hardcoded answers.
  * Supports: Python, JavaScript, Java, C++
@@ -132,9 +141,9 @@ async function executePythonLocally(source_code, stdin, startTime) {
     let stderr = '';
     let isTimedOut = false;
 
-    const proc = spawn(PYTHON_BIN, ['-u', filePath], {
+    const proc = spawn(PYTHON_BIN, ['-u', '-B', '-I', filePath], {
       timeout: 7000,
-      env: { ...process.env, PYTHONUNBUFFERED: '1' }
+      env: SANITIZED_EXEC_ENV
     });
 
     const timer = setTimeout(() => {
@@ -239,8 +248,9 @@ async function executeJavaScriptLocally(source_code, stdin, startTime) {
     let stderr = '';
     let isTimedOut = false;
 
-    const proc = spawn(NODE_BIN, [filePath], {
-      timeout: 7000
+    const proc = spawn(NODE_BIN, ['--max-old-space-size=64', filePath], {
+      timeout: 7000,
+      env: SANITIZED_EXEC_ENV
     });
 
     const timer = setTimeout(() => {

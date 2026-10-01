@@ -109,7 +109,7 @@ class InteractiveExecutionManager {
           compileArgs.unshift('-isysroot', MACOS_SDK);
         }
 
-        onOutput({ stream: 'system', data: '[Compiling C++ solution...]\n' });
+        onOutput({ sessionId, stream: 'system', data: '[Compiling C++ solution...]\n' });
 
         const compileProc = spawn('/usr/bin/clang++', compileArgs, {
           cwd: tmpDir,
@@ -124,9 +124,9 @@ class InteractiveExecutionManager {
         });
 
         if (compileExitCode !== 0) {
-          onOutput({ stream: 'stderr', data: `Compilation Error:\n${compileErr}\n` });
+          onOutput({ sessionId, stream: 'stderr', data: `Compilation Error:\n${compileErr}\n` });
           this.cleanupTmp(tmpDir);
-          if (onExit) onExit({ exitCode: compileExitCode, signal: null, totalOutput: compileErr });
+          if (onExit) onExit({ sessionId, exitCode: compileExitCode, signal: null, totalOutput: compileErr });
           return null;
         }
 
@@ -138,11 +138,12 @@ class InteractiveExecutionManager {
       } else {
         // Fallback for languages without local interactive runner
         onOutput({
+          sessionId,
           stream: 'stderr',
           data: `Error: Interactive terminal currently supports Python, JavaScript, and C++. Unsupported: ${language}\n`
         });
         this.cleanupTmp(tmpDir);
-        if (onExit) onExit({ exitCode: 1, signal: null, totalOutput: 'Unsupported language' });
+        if (onExit) onExit({ sessionId, exitCode: 1, signal: null, totalOutput: 'Unsupported language' });
         return null;
       }
     } catch (launchErr) {
@@ -179,7 +180,11 @@ class InteractiveExecutionManager {
       tmpDir,
       watchdogTimer,
       createdAt: Date.now(),
-      getFullOutput: () => fullOutput
+      getFullOutput: () => fullOutput,
+      appendStdin: (input) => {
+        totalOutputLength += input.length;
+        fullOutput += input;
+      }
     };
 
     this.sessions.set(sessionId, session);
@@ -202,7 +207,7 @@ class InteractiveExecutionManager {
         return;
       }
 
-      onOutput({ stream: 'stdout', data: text });
+      onOutput({ sessionId, stream: 'stdout', data: text });
     });
 
     // Stream process stderr in real time
@@ -219,7 +224,7 @@ class InteractiveExecutionManager {
         return;
       }
 
-      onOutput({ stream: 'stderr', data: text });
+      onOutput({ sessionId, stream: 'stderr', data: text });
     });
 
     // Process termination listener
@@ -230,6 +235,7 @@ class InteractiveExecutionManager {
 
       if (onExit) {
         onExit({
+          sessionId,
           exitCode: exitCode !== null ? exitCode : (signal ? 1 : 0),
           signal,
           totalOutput: fullOutput
@@ -258,6 +264,9 @@ class InteractiveExecutionManager {
 
     if (session.process.stdin && session.process.stdin.writable) {
       session.process.stdin.write(input);
+      if (typeof session.appendStdin === 'function') {
+        session.appendStdin(input);
+      }
       return true;
     }
 

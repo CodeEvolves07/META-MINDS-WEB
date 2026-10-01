@@ -13,8 +13,9 @@ import OutputConsole from '../components/OutputConsole';
 import InterviewerNotes from '../components/InterviewerNotes';
 import CandidateGuidance from '../components/CandidateGuidance';
 import EndInterviewModal from '../components/EndInterviewModal';
+import { WaitingRoomCountdown } from '../components/JoinCountdown';
 
-import { Loader2, AlertCircle } from 'lucide-react';
+import { Loader2, AlertCircle, Clock, ShieldAlert, ArrowLeft, UserPlus, Check, X } from 'lucide-react';
 import confetti from 'canvas-confetti';
 
 export default function InterviewRoomPage() {
@@ -39,6 +40,20 @@ export default function InterviewRoomPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [roomError, setRoomError] = useState('');
   const [interviewSession, setInterviewSession] = useState(null);
+
+  // Admission status: 'PENDING' | 'ACCEPTED' | 'DECLINED'
+  const initialAdmission = isInterviewer 
+    ? 'ACCEPTED' 
+    : (location.state?.admissionStatus || localStorage.getItem(`codemeet_admission_${roomId}`) || 'PENDING');
+  const [admissionStatus, setAdmissionStatus] = useState(initialAdmission);
+  const [pendingJoinRequests, setPendingJoinRequests] = useState([]);
+  const [declineReason, setDeclineReason] = useState(
+    location.state?.declineReason || localStorage.getItem(`codemeet_decline_msg_${roomId}`) || ''
+  );
+  const [isJoinWindowExpired, setIsJoinWindowExpired] = useState(false);
+  // Screen violation counts and warning banner
+  const [tabViolations, setTabViolations] = useState({});
+  const [candidateWarningBanner, setCandidateWarningBanner] = useState('');
 
   // Real-time connection states
   const [socketConnected, setSocketConnected] = useState(false);
@@ -78,14 +93,8 @@ export default function InterviewRoomPage() {
   const [activeTerminalSessionId, setActiveTerminalSessionId] = useState(null);
   const [candidateTerminalMap, setCandidateTerminalMap] = useState({}); // { [candidateId]: { [questionId]: string } }
 
-  // Interviewer Private Notes (Role-guarded!)
-  const [privateNotes, setPrivateNotes] = useState({
-    communicationRating: 0,
-    problemSolvingRating: 0,
-    technicalRating: 0,
-    comments: '',
-    overallScore: 0
-  });
+  // Interviewer Private Notes (Per-candidate remarks & evaluations, role-guarded!)
+  const [candidateNotesMap, setCandidateNotesMap] = useState({}); // { [candidateId]: notesObject }
   const [isSavingNotes, setIsSavingNotes] = useState(false);
 
   // End Interview Modal
@@ -129,8 +138,14 @@ export default function InterviewRoomPage() {
 
         if (isMounted) {
           setInterviewSession(res.interview);
+          const deadline = res.interview.meetingJoinDeadline || (new Date(res.interview.createdAt).getTime() + 5 * 60 * 1000);
+          setIsJoinWindowExpired(Date.now() >= deadline);
           const initialLang = res.interview.language || 'python';
           setLanguage(initialLang);
+
+          if (res.interview.tabViolations) {
+            setTabViolations(res.interview.tabViolations);
+          }
 
           if (isInterviewer) {
             // Interviewer starts with empty editor or observed candidate code
@@ -143,12 +158,29 @@ export default function InterviewRoomPage() {
             if (res.interview.assignedQuestions) {
               setAssignedMap(res.interview.assignedQuestions);
             }
-            if (res.interview.privateNotes) {
-              setPrivateNotes(res.interview.privateNotes);
+            if (res.interview.candidateNotes) {
+              setCandidateNotesMap(res.interview.candidateNotes);
+            } else if (res.interview.privateNotes) {
+              const firstCand = res.interview.registeredCandidates?.[0] || 'Candidate';
+              setCandidateNotesMap({ [firstCand]: res.interview.privateNotes });
+            }
+            if (res.interview.pendingJoinRequests) {
+              setPendingJoinRequests(res.interview.pendingJoinRequests);
             }
             setCode('');
             setCurrentProblemId(DEFAULT_PROBLEM.id);
           } else {
+            const currentAdmission = res.interview.isDisqualified 
+              ? 'DISQUALIFIED' 
+              : (res.interview.admissionStatus || localStorage.getItem(`codemeet_admission_${roomId}`) || 'PENDING');
+            setAdmissionStatus(currentAdmission);
+            localStorage.setItem(`codemeet_admission_${roomId}`, currentAdmission);
+
+            if (currentAdmission === 'DISQUALIFIED') {
+              setDeclineReason('You have been disqualified from this interview and cannot rejoin.');
+              localStorage.setItem(`codemeet_decline_msg_${roomId}`, 'You have been disqualified from this interview and cannot rejoin.');
+            }
+
             // Candidate: Completely blank unless previously typed by this candidate
             const candCodeObj = res.interview.candidateCode?.[userName] || {};
             setCandidateCodeMap(candCodeObj);
@@ -183,6 +215,15 @@ export default function InterviewRoomPage() {
       } catch (err) {
         console.error('Failed to load room:', err);
         if (isMounted) {
+          if (err.response?.status === 403 && err.response?.data?.disqualified) {
+            setAdmissionStatus('DISQUALIFIED');
+            const msg = err.response.data.message || 'You have been disqualified from this interview and cannot rejoin.';
+            setDeclineReason(msg);
+            localStorage.setItem(`codemeet_admission_${roomId}`, 'DISQUALIFIED');
+            localStorage.setItem(`codemeet_decline_msg_${roomId}`, msg);
+            setIsLoading(false);
+            return;
+          }
           setRoomError(err.response?.data?.message || 'Interview room not found or unavailable.');
           setIsLoading(false);
         }
@@ -196,12 +237,131 @@ export default function InterviewRoomPage() {
     };
   }, [roomId, role, isInterviewer]);
 
+  // 1.5 Periodically check join window expiration for interviewer status
+  useEffect(() => {
+    if (!interviewSession) return;
+    const deadline = interviewSession.meetingJoinDeadline || (new Date(interviewSession.createdAt).getTime() + 5 * 60 * 1000);
+    const updateExpiry = () => {
+      setIsJoinWindowExpired(Date.now() >= deadline);
+    };
+    updateExpiry();
+    const timer = setInterval(updateExpiry, 5000);
+    return () => clearInterval(timer);
+  }, [interviewSession]);
+
+  // 1.8 Active Interview Screen / Tab Monitoring for Admitted Candidates
+  // STRICT WEBRTC ISOLATION: Independent lifecycle; zero effect on camera, mic, or media streams!
+  const screenHiddenRef = useRef(false);
+  useEffect(() => {
+    // Only monitor candidates who are actively admitted ('ACCEPTED') inside the interview room
+    if (isInterviewer || admissionStatus !== 'ACCEPTED') return;
+
+    const handleVisibilityChange = () => {
+      const socket = getSocket();
+      if (!socket || !socket.connected) return;
+
+      if (document.visibilityState === 'hidden') {
+        if (!screenHiddenRef.current) {
+          screenHiddenRef.current = true;
+          socket.emit('candidate:screen-hidden');
+        }
+      } else if (document.visibilityState === 'visible') {
+        if (screenHiddenRef.current) {
+          screenHiddenRef.current = false;
+          socket.emit('candidate:screen-visible');
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [isInterviewer, admissionStatus]);
+
   // 2. Initialize Socket and WebRTC connections
   useEffect(() => {
     if (isLoading || roomError) return;
 
     const socket = initSocket();
     setSocketConnected(socket.connected);
+
+    // ADMISSION GATE: Candidate awaiting interviewer approval does NOT initialize WebRTC or enter room!
+    if (!isInterviewer && admissionStatus !== 'ACCEPTED') {
+      const handleAdmissionStatus = ({ status, message, expired }) => {
+        if (status) {
+          setAdmissionStatus(status);
+          localStorage.setItem(`codemeet_admission_${roomId}`, status);
+        }
+        if (message) {
+          setDeclineReason(message);
+          localStorage.setItem(`codemeet_decline_msg_${roomId}`, message);
+        }
+        if (status === 'ACCEPTED') {
+          showToast('🎉 Your request was accepted. You may now join the interview.');
+        } else if (status === 'DECLINED') {
+          showToast(message || '❌ Your request to join the interview was declined.');
+        } else if (status === 'DISQUALIFIED') {
+          showToast(message || '❌ You have been disqualified from this interview and cannot rejoin.');
+        }
+      };
+
+      const handleJoinAccepted = () => {
+        setAdmissionStatus('ACCEPTED');
+        localStorage.setItem(`codemeet_admission_${roomId}`, 'ACCEPTED');
+        showToast('🎉 Your request was accepted. You may now join the interview.');
+      };
+
+      const handleJoinDeclined = (data) => {
+        setAdmissionStatus('DECLINED');
+        localStorage.setItem(`codemeet_admission_${roomId}`, 'DECLINED');
+        const msg = data?.message || (data?.expired ? 'Your time for joining the meeting has expired.' : 'Your request to join the interview was declined by the interviewer.');
+        setDeclineReason(msg);
+        localStorage.setItem(`codemeet_decline_msg_${roomId}`, msg);
+        showToast(msg);
+      };
+
+      const handleCandidateDisqualified = (data) => {
+        setAdmissionStatus('DISQUALIFIED');
+        localStorage.setItem(`codemeet_admission_${roomId}`, 'DISQUALIFIED');
+        const msg = data?.message || 'You have been disqualified from this interview and cannot rejoin.';
+        setDeclineReason(msg);
+        localStorage.setItem(`codemeet_decline_msg_${roomId}`, msg);
+        showToast(msg);
+      };
+
+      const handleConnect = () => {
+        setSocketConnected(true);
+        socket.emit('candidate:join-request', {
+          roomId,
+          candidateName: userName,
+          candidateId: userName
+        });
+      };
+
+      socket.on('admission-status', handleAdmissionStatus);
+      socket.on('candidate-join-accepted', handleJoinAccepted);
+      socket.on('candidate-join-declined', handleJoinDeclined);
+      socket.on('candidate-disqualified', handleCandidateDisqualified);
+      socket.on('connect', handleConnect);
+
+      // Join waiting socket channel only
+      if (socket.connected) {
+        socket.emit('candidate:join-request', {
+          roomId,
+          candidateName: userName,
+          candidateId: userName
+        });
+      }
+
+      return () => {
+        socket.off('admission-status', handleAdmissionStatus);
+        socket.off('candidate-join-accepted', handleJoinAccepted);
+        socket.off('candidate-join-declined', handleJoinDeclined);
+        socket.off('candidate-disqualified', handleCandidateDisqualified);
+        socket.off('connect', handleConnect);
+      };
+    }
 
     // Instantiate Multi-Peer WebRTC Manager
     const webrtc = new WebRTCManager({
@@ -312,6 +472,24 @@ export default function InterviewRoomPage() {
             setOutputResult(data.candidateOutputs[userName][currentProblemRef.current]);
           }
         }
+      }
+      if (data.pendingRequests && isInterviewer) {
+        setPendingJoinRequests(data.pendingRequests);
+      }
+      if (data.tabViolations) {
+        setTabViolations(data.tabViolations);
+      }
+      if (data.candidateAdmissions && isInterviewer) {
+        setInterviewSession((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            candidateAdmissions: {
+              ...(prev.candidateAdmissions || {}),
+              ...data.candidateAdmissions
+            }
+          };
+        });
       }
     });
 
@@ -474,6 +652,28 @@ export default function InterviewRoomPage() {
       }
     });
 
+    // Interviewer Admission Requests Sync
+    socket.on('candidate-join-request', (req) => {
+      if (isInterviewer) {
+        setPendingJoinRequests((prev) => {
+          const exists = prev.some((r) => r.candidateId === req.candidateId);
+          if (exists) return prev;
+          return [...prev, req];
+        });
+        showToast(`Candidate ${req.candidateName || req.candidateId} wants to join the interview.`);
+      }
+    });
+
+    socket.on('candidate-admission-updated', ({ candidateId, decision, pendingRequests }) => {
+      if (isInterviewer) {
+        if (Array.isArray(pendingRequests)) {
+          setPendingJoinRequests(pendingRequests);
+        } else {
+          setPendingJoinRequests((prev) => prev.filter((r) => r.candidateId !== candidateId));
+        }
+      }
+    });
+
     // Candidate Code Execution Notifications (ISOLATED: scoped to runner + interviewer, NEVER other candidates!)
     socket.on('candidate-code-run-started', ({ candidateId, questionId, userName: runnerName }) => {
       if (isInterviewer) {
@@ -529,6 +729,16 @@ export default function InterviewRoomPage() {
       setActiveTerminalSessionId(sessionId);
     });
 
+    socket.on('terminal-started', ({ roomId, candidateId, questionId }) => {
+      const isTargetCandidate = isInterviewer
+        ? (selectedCandidateIdRef.current === candidateId)
+        : (userName === candidateId);
+
+      if (isTargetCandidate && currentProblemRef.current === questionId) {
+        setIsRunning(true);
+      }
+    });
+
     socket.on('terminal-output', ({ sessionId, candidateId, questionId, stream, data }) => {
       setCandidateTerminalMap((prev) => {
         const candLogs = prev[candidateId] || {};
@@ -547,6 +757,28 @@ export default function InterviewRoomPage() {
         setTerminalLog((prev) => prev + data);
       }
     });
+
+    const handleTerminalStdin = ({ sessionId, candidateId, questionId, input }) => {
+      setCandidateTerminalMap((prev) => {
+        const candLogs = prev[candidateId] || {};
+        const qLog = (candLogs[questionId] || '') + input;
+        return {
+          ...prev,
+          [candidateId]: { ...candLogs, [questionId]: qLog }
+        };
+      });
+
+      const isTargetCandidate = isInterviewer
+        ? (selectedCandidateIdRef.current === candidateId)
+        : (userName === candidateId);
+
+      if (isTargetCandidate && currentProblemRef.current === questionId) {
+        setTerminalLog((prev) => prev + input);
+      }
+    };
+
+    socket.on('terminal-stdin', handleTerminalStdin);
+    socket.on('interactive:stdin', handleTerminalStdin);
 
     socket.on('terminal-exit', ({ sessionId, candidateId, questionId, exitCode, signal }) => {
       const exitMsg = `\n[Process completed with exit code ${exitCode}]\n`;
@@ -608,6 +840,47 @@ export default function InterviewRoomPage() {
       }, 1000);
     });
 
+    // Active Screen Monitoring: Candidate warning (Violation 1 and 2)
+    socket.on('screen-violation-warning', ({ violations, message }) => {
+      const warningText = message || 'Warning: You are visiting another tab. This is not allowed. You will be disqualified.';
+      setCandidateWarningBanner(warningText);
+      showToast(`⚠️ ${warningText}`);
+      setTabViolations((prev) => ({ ...prev, [userName]: violations }));
+    });
+
+    // Active Screen Monitoring: Candidate disqualified (Violation 3)
+    socket.on('candidate-disqualified', ({ message }) => {
+      const dqMsg = message || 'You have been disqualified from the interview because you visited another tab three times.';
+      setAdmissionStatus('DISQUALIFIED');
+      setDeclineReason(dqMsg);
+      localStorage.setItem(`codemeet_admission_${roomId}`, 'DISQUALIFIED');
+      localStorage.setItem(`codemeet_decline_msg_${roomId}`, dqMsg);
+      showToast(`❌ ${dqMsg}`);
+      if (webrtcManagerRef.current) {
+        webrtcManagerRef.current.close();
+      }
+    });
+
+    // Active Screen Monitoring: Interviewer notifications (Violation 1, 2, and 3)
+    socket.on('candidate-screen-violation', ({ candidateId, candidateName, violations, disqualified, message }) => {
+      setTabViolations((prev) => ({ ...prev, [candidateId]: violations }));
+      if (disqualified) {
+        showToast(`🚫 ${message}`);
+        setInterviewSession((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            candidateAdmissions: {
+              ...(prev.candidateAdmissions || {}),
+              [candidateId]: 'DISQUALIFIED'
+            }
+          };
+        });
+      } else {
+        showToast(`⚠️ ${message}`);
+      }
+    });
+
     // Initial join emission if socket was already open
     if (socket.connected) {
       console.log('[WEBRTC] socket connected');
@@ -642,8 +915,16 @@ export default function InterviewRoomPage() {
       socket.off('code-submitted');
       socket.off('interview-ended');
       socket.off('user-left');
+      socket.off('candidate-join-request');
+      socket.off('candidate-admission-updated');
+      socket.off('screen-violation-warning');
+      socket.off('candidate-disqualified');
+      socket.off('candidate-screen-violation');
+      socket.off('terminal-started');
       socket.off('terminal-ready');
       socket.off('terminal-output');
+      socket.off('terminal-stdin');
+      socket.off('interactive:stdin');
       socket.off('terminal-exit');
       socket.off('terminal-error');
 
@@ -651,7 +932,7 @@ export default function InterviewRoomPage() {
         webrtcManagerRef.current.close();
       }
     };
-  }, [isLoading, roomError, roomId, role, userName, isInterviewer]);
+  }, [isLoading, roomError, roomId, role, userName, isInterviewer, admissionStatus]);
 
   // Candidate list for interviewer (includes connected participants + known room candidates)
   const candidateIdsSet = new Set();
@@ -663,11 +944,15 @@ export default function InterviewRoomPage() {
         const cId = p.candidateId || p.userName;
         if (cId && !candidateIdsSet.has(cId)) {
           candidateIdsSet.add(cId);
+          const vCount = tabViolations[cId] || 0;
+          const isDq = interviewSession?.candidateAdmissions?.[cId] === 'DISQUALIFIED' || vCount >= 3;
           candidatesList.push({
             candidateId: cId,
             userName: p.userName || cId,
             socketId: p.socketId,
-            status: 'Joined'
+            violations: vCount,
+            isDisqualified: isDq,
+            status: isDq ? 'DISQUALIFIED' : 'Active'
           });
         }
       }
@@ -675,16 +960,21 @@ export default function InterviewRoomPage() {
 
     const knownCandidateIds = [
       ...(interviewSession?.registeredCandidates || []),
-      ...Object.keys(assignedMap || {})
+      ...Object.keys(assignedMap || {}),
+      ...Object.keys(tabViolations || {})
     ];
     knownCandidateIds.forEach((cId) => {
       if (cId && cId !== 'Interviewer' && !candidateIdsSet.has(cId)) {
         candidateIdsSet.add(cId);
+        const vCount = tabViolations[cId] || 0;
+        const isDq = interviewSession?.candidateAdmissions?.[cId] === 'DISQUALIFIED' || vCount >= 3;
         candidatesList.push({
           candidateId: cId,
           userName: cId,
           socketId: null,
-          status: 'Joined'
+          violations: vCount,
+          isDisqualified: isDq,
+          status: isDq ? 'DISQUALIFIED' : 'Active'
         });
       }
     });
@@ -713,6 +1003,28 @@ export default function InterviewRoomPage() {
     }
   }, [candidatesList, isInterviewer, selectedCandidateId, currentProblemId, allCandidatesCodeMap, allCandidatesOutputMap, assignedMap]);
 
+  // Handle Candidate Admission Decision (Accept / Decline by Interviewer)
+  const handleAdmissionDecision = async (candidateId, decision) => {
+    try {
+      await api.decideAdmission(roomId, candidateId, decision);
+      setPendingJoinRequests((prev) => prev.filter((r) => r.candidateId !== candidateId));
+      if (decision === 'ACCEPTED') {
+        showToast(`${candidateId} has been admitted.`);
+      } else {
+        showToast(`${candidateId}'s request was declined.`);
+      }
+      const socket = initSocket();
+      socket.emit('admission-decision', { roomId, candidateId, decision });
+    } catch (err) {
+      console.error('Failed to submit admission decision:', err);
+      const msg = err.response?.data?.message || 'Failed to update admission status';
+      showToast(msg);
+      if (err.response?.data?.expired) {
+        setPendingJoinRequests((prev) => prev.filter((r) => r.candidateId !== candidateId));
+      }
+    }
+  };
+
   // Handle Candidate Selection (Interviewer)
   const handleSelectCandidate = (candId) => {
     setSelectedCandidateId(candId);
@@ -726,7 +1038,7 @@ export default function InterviewRoomPage() {
     const candOutput = allCandidatesOutputMap[candId]?.[candProbId] || null;
     setOutputResult(candOutput);
 
-    const candTerminal = candidateTerminalMap[candId]?.[candProbId] || '';
+    const candTerminal = candidateTerminalMap[candId]?.[candProbId] || candOutput?.stdout || '';
     setTerminalLog(candTerminal);
 
     showToast(`Viewing code for ${candId}`);
@@ -851,9 +1163,12 @@ export default function InterviewRoomPage() {
         if (candData?.language) setLanguage(candData.language);
         const candOutput = allCandidatesOutputMap[selectedCandidateId]?.[newProbId] || null;
         setOutputResult(candOutput);
+        const candTerminal = candidateTerminalMap[selectedCandidateId]?.[newProbId] || candOutput?.stdout || '';
+        setTerminalLog(candTerminal);
       } else {
         setCode('');
         setOutputResult(null);
+        setTerminalLog('');
       }
     }
   };
@@ -936,10 +1251,20 @@ export default function InterviewRoomPage() {
           setTimeout(() => {
             const curSessionId = activeTerminalSessionIdRef.current;
             if (curSessionId) {
+              const formattedStdin = stdin.endsWith('\n') ? stdin : stdin + '\n';
+              setTerminalLog((prev) => prev + formattedStdin);
+              setCandidateTerminalMap((prev) => {
+                const candLogs = prev[userName] || {};
+                const qLog = (candLogs[currentProblemId] || '') + formattedStdin;
+                return {
+                  ...prev,
+                  [userName]: { ...candLogs, [currentProblemId]: qLog }
+                };
+              });
               socket.emit('terminal-input', {
                 roomId,
                 sessionId: curSessionId,
-                input: stdin.endsWith('\n') ? stdin : stdin + '\n'
+                input: formattedStdin
               });
             }
           }, 350);
@@ -970,6 +1295,14 @@ export default function InterviewRoomPage() {
   const handleSendTerminalInput = (input) => {
     if (!input) return;
     setTerminalLog((prev) => prev + input);
+    setCandidateTerminalMap((prev) => {
+      const candLogs = prev[userName] || {};
+      const qLog = (candLogs[currentProblemId] || '') + input;
+      return {
+        ...prev,
+        [userName]: { ...candLogs, [currentProblemId]: qLog }
+      };
+    });
 
     const socket = getSocket();
     const curSessionId = activeTerminalSessionIdRef.current;
@@ -1035,14 +1368,42 @@ export default function InterviewRoomPage() {
     }
   };
 
-  // Save Interviewer Notes (INTERVIEWER ONLY)
+  const currentCandidateNotes = (selectedCandidateId && candidateNotesMap[selectedCandidateId]) || {
+    communicationRating: 0,
+    problemSolvingRating: 0,
+    technicalRating: 0,
+    comments: '',
+    overallScore: 0
+  };
+
+  const handleNotesChange = (updatedNotes) => {
+    if (!selectedCandidateId) return;
+    setCandidateNotesMap((prev) => ({
+      ...prev,
+      [selectedCandidateId]: updatedNotes
+    }));
+  };
+
+  // Save Interviewer Notes for currently selected candidate (INTERVIEWER ONLY)
   const handleSaveNotes = async () => {
-    if (!isInterviewer) return;
+    if (!isInterviewer || !selectedCandidateId) return;
     try {
       setIsSavingNotes(true);
-      await api.saveNotes(roomId, privateNotes, 'interviewer');
+      const notesToSave = candidateNotesMap[selectedCandidateId] || {
+        communicationRating: 0,
+        problemSolvingRating: 0,
+        technicalRating: 0,
+        comments: '',
+        overallScore: 0
+      };
+      await api.saveNotes(roomId, {
+        candidateId: selectedCandidateId,
+        ...notesToSave
+      });
+      showToast(`Remarks saved for ${selectedCandidateId}`);
     } catch (err) {
       console.error('Failed to save notes:', err);
+      showToast('Failed to save remarks: ' + (err.response?.data?.message || err.message));
     } finally {
       setIsSavingNotes(false);
     }
@@ -1069,7 +1430,11 @@ export default function InterviewRoomPage() {
           }
         }
 
-        await api.endInterview(roomId, privateNotes);
+        await api.endInterview(roomId, {
+          candidateId: selectedCandidateId,
+          candidateNotes: candidateNotesMap,
+          ...(candidateNotesMap[selectedCandidateId] || {})
+        });
         const socket = getSocket();
         if (socket && socket.connected) {
           socket.emit('end-interview', { roomId });
@@ -1138,6 +1503,156 @@ export default function InterviewRoomPage() {
     );
   }
 
+  // Candidate Awaiting Approval (WAITING STATE - Outside room, no WebRTC, no interview features)
+  if (!isInterviewer && admissionStatus === 'PENDING') {
+    return (
+      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-center font-sans">
+        <div className="max-w-md w-full bg-slate-900 border border-indigo-500/30 rounded-2xl p-8 shadow-2xl backdrop-blur-xl relative overflow-hidden">
+          <div className="absolute -top-12 -right-12 w-32 h-32 bg-indigo-500/10 rounded-full blur-2xl pointer-events-none" />
+          <div className="w-16 h-16 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 flex items-center justify-center mx-auto mb-6">
+            <Clock className="w-8 h-8 animate-pulse text-indigo-400" />
+          </div>
+          
+          <h2 className="text-xl font-bold text-white mb-2">
+            Waiting for interviewer approval...
+          </h2>
+          <p className="text-sm text-slate-400 mb-6 leading-relaxed">
+            Your request has been sent to the interviewer. You will enter the interview room automatically once approved.
+          </p>
+
+          <div className="bg-slate-950/60 border border-slate-800 rounded-xl p-4 mb-6 text-left space-y-2">
+            <div className="flex justify-between text-xs">
+              <span className="text-slate-500">Interview Room:</span>
+              <span className="text-slate-300 font-mono font-semibold">{roomId}</span>
+            </div>
+            <div className="flex justify-between text-xs">
+              <span className="text-slate-500">Candidate Name:</span>
+              <span className="text-slate-300 font-semibold">{userName}</span>
+            </div>
+            <div className="flex justify-between text-xs">
+              <span className="text-slate-500">Status:</span>
+              <span className="inline-flex items-center gap-1.5 text-amber-400 font-medium">
+                <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping"></span>
+                Waiting for Approval
+              </span>
+            </div>
+            {interviewSession?.meetingJoinDeadline && (
+              <WaitingRoomCountdown 
+                deadline={interviewSession.meetingJoinDeadline} 
+                serverTime={interviewSession.serverTime}
+                isJoinWindowExpired={isJoinWindowExpired}
+              />
+            )}
+          </div>
+
+          <div className="flex items-center justify-center gap-3">
+            <button
+              onClick={() => navigate('/join')}
+              className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold flex items-center gap-2 transition"
+            >
+              <ArrowLeft className="w-4 h-4" />
+              Change Code / Name
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Candidate Declined Screen (Outside room, cannot enter)
+  if (!isInterviewer && admissionStatus === 'DECLINED') {
+    const isExpired = declineReason === 'Your time for joining the meeting has expired.' || declineReason?.includes('expired');
+    return (
+      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-center font-sans">
+        <div className="max-w-md w-full bg-slate-900 border border-rose-500/30 rounded-2xl p-8 shadow-2xl backdrop-blur-xl relative overflow-hidden">
+          <div className="w-16 h-16 rounded-2xl bg-rose-500/10 border border-rose-500/20 text-rose-400 flex items-center justify-center mx-auto mb-6">
+            <ShieldAlert className="w-8 h-8 text-rose-400" />
+          </div>
+          
+          <h2 className="text-xl font-bold text-white mb-2">
+            {isExpired ? 'Join Window Expired' : 'Request Declined'}
+          </h2>
+          <p className="text-sm text-slate-300 mb-6 leading-relaxed">
+            {declineReason || 'Your request to join the interview was declined by the interviewer.'}
+          </p>
+
+          <div className="bg-slate-950/60 border border-slate-800 rounded-xl p-4 mb-6 text-left space-y-2">
+            <div className="flex justify-between text-xs">
+              <span className="text-slate-500">Interview Room:</span>
+              <span className="text-slate-300 font-mono">{roomId}</span>
+            </div>
+            <div className="flex justify-between text-xs">
+              <span className="text-slate-500">Status:</span>
+              <span className="text-rose-400 font-semibold">{isExpired ? 'Time Expired' : 'Entry Declined'}</span>
+            </div>
+          </div>
+
+          <button
+            onClick={() => {
+              localStorage.removeItem(`codemeet_admission_${roomId}`);
+              localStorage.removeItem(`codemeet_decline_msg_${roomId}`);
+              navigate('/join');
+            }}
+            className="w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold flex items-center justify-center gap-2 transition"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            Return to Join Interview
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Candidate Disqualified Screen (Violation #3 or Attempting to rejoin)
+  if (!isInterviewer && admissionStatus === 'DISQUALIFIED') {
+    return (
+      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-center font-sans">
+        <div className="max-w-md w-full bg-slate-900 border border-rose-500/40 rounded-2xl p-8 shadow-2xl backdrop-blur-xl relative overflow-hidden">
+          <div className="absolute -top-12 -right-12 w-32 h-32 bg-rose-500/10 rounded-full blur-2xl pointer-events-none" />
+          <div className="w-16 h-16 rounded-2xl bg-rose-500/15 border border-rose-500/30 text-rose-400 flex items-center justify-center mx-auto mb-6">
+            <ShieldAlert className="w-8 h-8 text-rose-400 animate-pulse" />
+          </div>
+          
+          <h2 className="text-xl font-bold text-white mb-2">
+            Disqualified from Interview
+          </h2>
+          <p className="text-sm text-rose-200 mb-6 leading-relaxed font-medium">
+            {declineReason || 'You have been disqualified from the interview because you visited another tab three times.'}
+          </p>
+
+          <div className="bg-slate-950/60 border border-slate-800 rounded-xl p-4 mb-6 text-left space-y-2">
+            <div className="flex justify-between text-xs">
+              <span className="text-slate-500">Interview Room:</span>
+              <span className="text-slate-300 font-mono font-semibold">{roomId}</span>
+            </div>
+            <div className="flex justify-between text-xs">
+              <span className="text-slate-500">Candidate Name:</span>
+              <span className="text-slate-300 font-semibold">{userName}</span>
+            </div>
+            <div className="flex justify-between text-xs">
+              <span className="text-slate-500">Screen Violations:</span>
+              <span className="text-rose-400 font-bold font-mono">3 / 3</span>
+            </div>
+            <div className="flex justify-between text-xs">
+              <span className="text-slate-500">Status:</span>
+              <span className="text-rose-400 font-bold uppercase tracking-wider">DISQUALIFIED</span>
+            </div>
+          </div>
+
+          <button
+            onClick={() => {
+              navigate('/join');
+            }}
+            className="w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold flex items-center justify-center gap-2 transition"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            Return to Join Interview
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen max-h-screen flex flex-col bg-slate-950 text-slate-100 overflow-hidden font-sans">
       {/* Toast Notification Banner */}
@@ -1148,6 +1663,53 @@ export default function InterviewRoomPage() {
         </div>
       )}
 
+      {/* Floating Interviewer Admission Request Notifications */}
+      {isInterviewer && pendingJoinRequests && pendingJoinRequests.length > 0 && (
+        <div className="fixed top-16 right-6 z-50 flex flex-col gap-3 max-w-sm w-full animate-fadeIn">
+          {pendingJoinRequests.map((req) => (
+            <div
+              key={req.candidateId}
+              className="bg-slate-900/95 border border-indigo-500/40 rounded-2xl p-4 shadow-2xl backdrop-blur-xl text-slate-100 flex flex-col gap-3"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-xl bg-indigo-500/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400 shrink-0">
+                    <UserPlus className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wide">
+                      Candidate wants to join
+                    </h4>
+                    <p className="text-sm font-semibold text-white mt-0.5">
+                      <span className="text-indigo-400 font-bold">{req.candidateName || req.candidateId}</span> wants to join the interview.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 pt-1">
+                <button
+                  id={`accept-candidate-${req.candidateId}`}
+                  onClick={() => handleAdmissionDecision(req.candidateId, 'ACCEPTED')}
+                  className="flex-1 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition shadow-lg shadow-emerald-900/30"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  Accept
+                </button>
+                <button
+                  id={`decline-candidate-${req.candidateId}`}
+                  onClick={() => handleAdmissionDecision(req.candidateId, 'DECLINED')}
+                  className="flex-1 py-2 bg-rose-600/80 hover:bg-rose-600 text-white rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition shadow-lg shadow-rose-900/30"
+                >
+                  <X className="w-3.5 h-3.5" />
+                  Decline
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Top Navigation */}
       <Navbar
         roomId={roomId}
@@ -1155,7 +1717,30 @@ export default function InterviewRoomPage() {
         connectionStatus={connectionStatus}
         socketConnected={socketConnected}
         onEndInterview={() => setIsEndModalOpen(true)}
+        isJoinWindowExpired={isJoinWindowExpired}
+        meetingJoinDeadline={interviewSession?.meetingJoinDeadline}
+        serverTime={interviewSession?.serverTime}
       />
+
+      {/* Active Screen Monitoring Warning Banner for Admitted Candidate */}
+      {candidateWarningBanner && !isInterviewer && (
+        <div className="bg-rose-950/90 border-b border-rose-500/50 text-rose-200 px-4 py-2 text-xs flex items-center justify-between shrink-0 animate-fadeIn z-40 backdrop-blur-md">
+          <div className="flex items-center gap-2.5">
+            <ShieldAlert className="w-4 h-4 text-rose-400 animate-pulse shrink-0" />
+            <span className="font-semibold text-rose-100">{candidateWarningBanner}</span>
+            <span className="bg-rose-900/70 border border-rose-700 text-rose-300 px-2 py-0.5 rounded text-[11px] font-mono">
+              Tab violations: {tabViolations[userName] || 1} / 3
+            </span>
+          </div>
+          <button
+            onClick={() => setCandidateWarningBanner('')}
+            className="text-rose-400 hover:text-rose-100 p-1 rounded-md transition"
+            title="Dismiss warning"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
 
       {/* Main 3-Column Studio Dashboard Layout */}
       <main className="flex-1 grid grid-cols-12 gap-3 p-3 overflow-hidden min-h-0">
@@ -1237,8 +1822,12 @@ export default function InterviewRoomPage() {
         <section className="col-span-12 lg:col-span-3 flex flex-col h-full min-h-0">
           {isInterviewer ? (
             <InterviewerNotes
-              notes={privateNotes}
-              onChangeNotes={setPrivateNotes}
+              candidateId={selectedCandidateId}
+              candidateName={selectedCandidateId}
+              candidatesList={candidatesList}
+              onSelectCandidate={handleSelectCandidate}
+              notes={currentCandidateNotes}
+              onChangeNotes={handleNotesChange}
               onSaveNotes={handleSaveNotes}
               isSaving={isSavingNotes}
             />
@@ -1254,7 +1843,7 @@ export default function InterviewRoomPage() {
         onClose={() => setIsEndModalOpen(false)}
         onConfirm={handleConfirmEndInterview}
         isInterviewer={isInterviewer}
-        notes={privateNotes}
+        notes={currentCandidateNotes}
         isEnding={isEnding}
       />
     </div>

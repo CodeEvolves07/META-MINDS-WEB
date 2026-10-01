@@ -1,6 +1,7 @@
-import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import React, { useState, useEffect } from 'react';
+import { useNavigate, useSearchParams, useParams } from 'react-router-dom';
 import { api } from '../services/api';
+import { JoinCountdownBanner } from '../components/JoinCountdown';
 import { 
   ArrowLeft, 
   User, 
@@ -13,11 +14,61 @@ import {
 
 export default function JoinInterviewPage() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const { roomId: routeRoomId } = useParams();
+  const urlRoomId = (routeRoomId || searchParams.get('room') || searchParams.get('id') || searchParams.get('code') || '').toUpperCase();
 
   const [candidateName, setCandidateName] = useState('');
-  const [roomId, setRoomId] = useState('');
+  const [roomId, setRoomId] = useState(urlRoomId);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState('');
+
+  // Server-authoritative meeting join deadline states
+  const [deadline, setDeadline] = useState(null);
+  const [serverTime, setServerTime] = useState(null);
+  const [isJoinWindowExpired, setIsJoinWindowExpired] = useState(false);
+  const [deadlineChecked, setDeadlineChecked] = useState(false);
+
+  useEffect(() => {
+    const cleanId = roomId.trim().toUpperCase();
+    if (cleanId.length !== 6) {
+      setDeadline(null);
+      setIsJoinWindowExpired(false);
+      setDeadlineChecked(false);
+      return;
+    }
+
+    let isMounted = true;
+    async function checkDeadline() {
+      try {
+        const res = await api.validateInterview(cleanId);
+        if (isMounted && res.success) {
+          setDeadline(res.deadline);
+          setServerTime(res.serverTime || Date.now());
+          setIsJoinWindowExpired(res.isJoinWindowExpired);
+          setDeadlineChecked(true);
+        }
+      } catch (err) {
+        if (isMounted) {
+          if (err.response?.status === 403 && err.response?.data?.expired) {
+            setDeadline(err.response?.data?.deadline || Date.now());
+            setServerTime(err.response?.data?.serverTime || Date.now());
+            setIsJoinWindowExpired(true);
+            setDeadlineChecked(true);
+          } else {
+            setDeadline(null);
+            setDeadlineChecked(false);
+          }
+        }
+      }
+    }
+
+    checkDeadline();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [roomId]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -41,9 +92,11 @@ export default function JoinInterviewPage() {
       const res = await api.joinInterview(cleanRoomId, cleanName);
 
       if (res.success && res.interview) {
-        // Save candidate role, name, and token in localStorage for this room
+        // Save candidate role, name, admission status, and token in localStorage for this room
+        const admissionStatus = res.admissionStatus || 'PENDING';
         localStorage.setItem(`codemeet_role_${cleanRoomId}`, 'candidate');
         localStorage.setItem(`codemeet_user_${cleanRoomId}`, cleanName);
+        localStorage.setItem(`codemeet_admission_${cleanRoomId}`, admissionStatus);
         if (res.token) {
           localStorage.setItem(`codemeet_token_${cleanRoomId}`, res.token);
         }
@@ -53,7 +106,8 @@ export default function JoinInterviewPage() {
             role: 'candidate',
             userName: cleanName,
             problemId: res.interview.problemId,
-            token: res.token
+            token: res.token,
+            admissionStatus
           }
         });
       } else {
@@ -63,6 +117,8 @@ export default function JoinInterviewPage() {
       console.error(err);
       if (err.response?.status === 404) {
         setError('Interview room not found.');
+      } else if (err.response?.status === 403 || err.response?.data?.expired) {
+        setError(err.response?.data?.message || 'Your time for joining the meeting has expired.');
       } else {
         setError(err.response?.data?.message || 'Interview room not found.');
       }
@@ -100,6 +156,15 @@ export default function JoinInterviewPage() {
               </p>
             </div>
           </div>
+
+          {/* Join Window Countdown Display */}
+          {deadlineChecked && deadline && (
+            <JoinCountdownBanner
+              deadline={deadline}
+              serverTime={serverTime}
+              isJoinWindowExpired={isJoinWindowExpired}
+            />
+          )}
 
           {/* Error Notice */}
           {error && (

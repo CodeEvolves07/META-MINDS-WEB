@@ -163,12 +163,21 @@ export default function ProblemSection({
                   >
                     <div className="flex items-center justify-between gap-1 mb-1">
                       <span className="text-xs font-bold text-white truncate flex items-center gap-1.5">
-                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+                        <span className={`w-1.5 h-1.5 rounded-full ${cand.isDisqualified ? 'bg-rose-500' : 'bg-emerald-400'}`}></span>
                         {cId}
                       </span>
-                      <span className="text-[9px] text-emerald-400 bg-emerald-950/70 border border-emerald-800/80 px-1 py-0.2 rounded font-medium shrink-0">
-                        Joined
+                      <span className={`text-[9px] px-1.5 py-0.2 rounded font-semibold shrink-0 border ${
+                        cand.isDisqualified 
+                          ? 'text-rose-400 bg-rose-950/70 border-rose-800/80' 
+                          : 'text-emerald-400 bg-emerald-950/70 border-emerald-800/80'
+                      }`}>
+                        {cand.isDisqualified ? 'DISQUALIFIED' : 'Active'}
                       </span>
+                    </div>
+
+                    <div className="text-[10px] text-slate-400 mb-1 flex items-center justify-between">
+                      <span>Screen violations: <strong className={cand.violations > 0 ? (cand.isDisqualified ? 'text-rose-400' : 'text-amber-400') : 'text-slate-300'}>{cand.violations || 0}</strong></span>
+                      <span>Status: <strong className={cand.isDisqualified ? 'text-rose-400' : 'text-emerald-400'}>{cand.isDisqualified ? 'DISQUALIFIED' : 'Active'}</strong></span>
                     </div>
 
                     <div className="text-[11px] mb-1.5 truncate">
@@ -184,30 +193,36 @@ export default function ProblemSection({
                       )}
                     </div>
 
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setModalCandidateId(cId);
-                      }}
-                      className={`w-full py-1 px-2 rounded text-[11px] font-semibold flex items-center justify-center gap-1 transition-all ${
-                        hasAssigned
-                          ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700'
-                          : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-sm shadow-indigo-900/40'
-                      }`}
-                    >
-                      {hasAssigned ? (
-                        <>
-                          <RotateCcw className="w-2.5 h-2.5 text-indigo-400" />
-                          <span>Change Question</span>
-                        </>
-                      ) : (
-                        <>
-                          <BookOpen className="w-2.5 h-2.5 text-white" />
-                          <span>Select Question</span>
-                        </>
-                      )}
-                    </button>
+                    {cand.isDisqualified ? (
+                      <div className="w-full py-1 px-2 rounded text-[11px] font-semibold text-center bg-rose-950/40 text-rose-400 border border-rose-800/50">
+                        Disqualified
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setModalCandidateId(cId);
+                        }}
+                        className={`w-full py-1 px-2 rounded text-[11px] font-semibold flex items-center justify-center gap-1 transition-all ${
+                          hasAssigned
+                            ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700'
+                            : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-sm shadow-indigo-900/40'
+                        }`}
+                      >
+                        {hasAssigned ? (
+                          <>
+                            <RotateCcw className="w-2.5 h-2.5 text-indigo-400" />
+                            <span>Change Question</span>
+                          </>
+                        ) : (
+                          <>
+                            <BookOpen className="w-2.5 h-2.5 text-white" />
+                            <span>Select Question</span>
+                          </>
+                        )}
+                      </button>
+                    )}
                   </div>
                 );
               })}
