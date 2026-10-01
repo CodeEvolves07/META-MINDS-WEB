@@ -1,0 +1,12 @@
+{
+  "name": "codemeet-root",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "install:all": "npm --prefix server install && npm --prefix client install",
+    "server": "npm --prefix server run dev",
+    "client": "npm --prefix client run dev -- --host 0.0.0.0 --port 3000",
+    "tunnel": "npx localtunnel --port 3000",
+    "ip": "node -e 'console.log(Object.values(require(\"os\").networkInterfaces()).flat().filter(i=>i.family===\"IPv4\"&&!i.internal).map(i=>\"http://\"+i.address+\":3000\"))'"
+  }
+}

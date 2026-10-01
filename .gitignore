@@ -1,28 +1,35 @@
 # Dependencies
 node_modules/
-*/node_modules/
+.pnp
+.pnp.js
 
-# Production Builds
+# Testing
+coverage/
+
+# Production builds
 dist/
 build/
-*/dist/
-*/build/
 
-# Environment Variables
+# Misc
+.DS_Store
+*.pem
+
+# Environment variables
 .env
 .env.local
-.env.*.local
-*.env
+.env.development.local
+.env.test.local
+.env.production.local
 
-# Logs
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-*.log
-
-# Editor & System Files
-.vscode/
+# IDE
 .idea/
-.DS_Store
-Thumbs.db
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Secrets and dependencies
+*.pem
+node_modules/

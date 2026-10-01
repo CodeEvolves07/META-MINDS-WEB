@@ -1,0 +1,20 @@
+{
+  "name": "codemeet-server",
+  "version": "1.0.0",
+  "description": "CodeMeet backend server with Express, Socket.IO, WebRTC signaling, and Judge0 integration",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "socket.io": "^4.8.0",
+    "socket.io-client": "^4.8.4",
+    "uuid": "^10.0.0"
+  }
+}
